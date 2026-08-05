@@ -67,8 +67,8 @@ void FeatureMatchState::onEnter(Simulation &sim)
               << "right-drag = rotate.\n"
               << "               Then " << kCaptureHelp
               << ". Ctrl+S saves the database, Ctrl+O loads it back. Ctrl+G auto-builds"
-              << " and saves one (arc path, simulated aim error) when you just need"
-              << " a database to test against." << std::endl;
+              << " and saves one (high survey circle, simulated aim error) when you"
+              << " just need a database to test against." << std::endl;
 }
 
 // Pose the player camera at the current build waypoint (so the right pane
@@ -371,7 +371,9 @@ void FeatureMatchState::loadDatabase(Simulation &sim, Renderer &renderer)
 // (poses 2-4 units off from carefully placed anchors).
 static constexpr float kSimulatedDepthErrorUnits = 4.0f;
 
-static constexpr size_t kDefaultAutoViews    = 8;    // ring stops
+static constexpr size_t kDefaultAutoViews    = 12;   // circle stops: below ~12 the
+                                                     // azimuth step outgrows SIFT's
+                                                     // viewpoint tolerance
 static constexpr size_t kMaxAutoViews        = 20;
 static constexpr size_t kDefaultAutoFeatures = 10;   // denser than the manual default:
                                                      // clicks are free here
@@ -383,28 +385,44 @@ void FeatureMatchState::autoBuild(Simulation &sim, Renderer &renderer)
     const size_t features = ::promptCount("Features per view", kMaxFeatures,
                                           kDefaultAutoFeatures);
 
-    // The path: an ARC of views around the terrain's middle, not a full ring.
-    // Measured lesson: a 10-stop ring puts 36 degrees between neighbouring
-    // views of the same spot, which defeats SIFT's rough 15-20 degree
-    // viewpoint tolerance on 3D relief -- appearance collection found 6
-    // appearances across 100 points and free flight matched only noise. An
-    // arc keeps neighbours a dozen degrees apart, the geometry every
-    // successful manual corridor had, at the cost of covering a sector
-    // instead of the circle -- the same density-versus-coverage trade the
-    // manual mode makes, decided the same way.
-    const float arcSpan  = glm::radians(120.0f);
-    const float radius   = 0.30f * sim.terrainSize;
-    const float altitude = 0.25f * sim.terrainSize;
+    // The path: a full circle, flown HIGH and aimed PAST the centre. A circle
+    // is the coverage the tool is for, and height is what makes one legal at
+    // all. Neighbouring views of one spot may differ by at most SIFT's rough
+    // 15-20 degree viewpoint tolerance; a low 10-stop ring blows that budget
+    // on the azimuth step alone (36 degrees -- measured: 6 collected
+    // appearances across 100 points, free flight matched only noise), but
+    // from high up an azimuth step is mostly an IN-PLANE rotation of the same
+    // picture, which SIFT absorbs by design. The out-of-plane residue is
+    // 2*asin(sin(step/2)*sin(tilt)): ~18 degrees at 12 stops and ~38 degrees
+    // of camera tilt, inside the budget and shrinking with every extra stop
+    // (hence the 12-view default, and the warning below).
+    //
+    // Aiming each view at a ground point PAST the centre stretches its
+    // footprint from just inside its own nadir, across the middle, to the far
+    // edge -- so the stops' strips fan around the compass and their union
+    // reaches essentially the whole map, which the map-spaced selection below
+    // then actually uses. No sky ever enters a frame: the top edge stays
+    // ~30 degrees below the horizon at this tilt.
+    const float tau       = 6.28318530718f;
+    const float radius    = 0.22f * sim.terrainSize;
+    const float altitude  = 0.50f * sim.terrainSize;
+    const float overshoot = 0.17f * sim.terrainSize;   // look-target radius past centre
+
+    if (views < 12)
+        std::cout << "FEATURES: note -- with fewer than ~12 stops a circle's azimuth"
+                     " steps outgrow SIFT's viewpoint tolerance; expect weaker"
+                     " cross-view collection" << std::endl;
 
     sim.waypoints.clear();
     sim.pathPoints.clear();
     for (size_t i = 0; i < views; i++) {
-        const float t     = views > 1 ? (float)i / (float)(views - 1) : 0.5f;
-        const float angle = (t - 0.5f) * arcSpan;
-        const glm::vec3 eye(radius * std::cos(angle), altitude, radius * std::sin(angle));
-        sim.waypoints.push_back({ eye, glm::vec3(0.0f) });
-        sim.pathPoints.push_back(eye);
+        const float angle = tau * (float)i / (float)views;
+        const glm::vec3 out(std::cos(angle), 0.0f, std::sin(angle));
+        sim.waypoints.push_back({ out * radius + glm::vec3(0.0f, altitude, 0.0f),
+                                  -out * overshoot });
+        sim.pathPoints.push_back(sim.waypoints.back().position);
     }
+    sim.pathPoints.push_back(sim.waypoints.front().position);   // close the ring on the map
 
     // Same lifecycle as startBuild: fresh database, any manual build in
     // progress discarded exactly as G would. The capture resolution does NOT
@@ -526,10 +544,13 @@ void FeatureMatchState::autoBuild(Simulation &sim, Renderer &renderer)
     addOtherViewAppearances(sim, renderer);
     refreshPlaces();
     std::cout << "FEATURES: auto-built " << placed << " points from "
-              << sim.waypoints.size() << " views on an arc (map spacing ~"
+              << sim.waypoints.size() << " views on a high survey circle (map spacing ~"
               << (int)idealSpacing << " units; simulated aim error sigma "
               << kSimulatedDepthErrorUnits << " units along the sight line). "
               << kCaptureHelp << std::endl;
+    std::cout << "FEATURES: recognition is strongest from viewpoints like the"
+                 " orbit's own -- fly near the grey ring, high, looking across"
+                 " the middle" << std::endl;
     saveDatabase(sim);
 }
 
